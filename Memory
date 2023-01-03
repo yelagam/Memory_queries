@@ -1,0 +1,77 @@
+---Memory by resources
+
+SELECT EventTime,
+record.value('(/Record/ResourceMonitor/Notification)[1]', 'varchar(max)') as [Type],
+record.value('(/Record/ResourceMonitor/IndicatorsProcess)[1]', 'int') as [IndicatorsProcess],
+record.value('(/Record/ResourceMonitor/IndicatorsSystem)[1]', 'int') as [IndicatorsSystem],
+record.value('(/Record/MemoryRecord/AvailablePhysicalMemory)[1]', 'bigint') AS [Avail Phys Mem, Kb],
+record.value('(/Record/MemoryRecord/AvailableVirtualAddressSpace)[1]', 'bigint') AS [Avail VAS, Kb]
+FROM (
+	SELECT
+	DATEADD (ss, (-1 * ((cpu_ticks / CONVERT (float, ( cpu_ticks / ms_ticks )))-[timestamp])/1000), GETDATE()) AS EventTime,
+	CONVERT (xml, record) AS record
+	FROM sys.dm_os_ring_buffers
+	CROSS JOIN sys.dm_os_sys_info
+	WHERE ring_buffer_type = 'RING_BUFFER_RESOURCE_MONITOR') AS tab
+ORDER BY EventTime DESC;
+
+---Memory by DB
+SELECT
+    DB_NAME(dm_os_buffer_descriptors.database_id) DatabaseName,
+    COUNT(*) AS [Total Pages In Buffer],
+    COUNT(*) * 8 / 1024 AS [Buffer Size in MB],
+    SUM(CASE dm_os_buffer_descriptors.is_modified 
+                WHEN 1 THEN 1 ELSE 0
+        END) AS [Dirty Pages],
+    SUM(CASE dm_os_buffer_descriptors.is_modified 
+                WHEN 1 THEN 0 ELSE 1
+        END) AS [Clean Pages],
+    SUM(CASE dm_os_buffer_descriptors.is_modified 
+                WHEN 1 THEN 1 ELSE 0
+        END) * 8 / 1024 AS [Dirty Page (MB)],
+    SUM(CASE dm_os_buffer_descriptors.is_modified 
+                WHEN 1 THEN 0 ELSE 1
+        END) * 8 / 1024 AS [Clean Page (MB)]
+FROM sys.dm_os_buffer_descriptors
+INNER JOIN sys.databases ON dm_os_buffer_descriptors.database_id = databases.database_id
+GROUP BY DB_NAME(dm_os_buffer_descriptors.database_id)
+ORDER BY [Total Pages In Buffer] DESC;
+
+
+----Memory_Summary
+SELECT 
+   CAST(SERVERPROPERTY('SERVERNAME') as Nvarchar) AS 'Instance',
+   (SELECT value_in_use FROM sys.configurations WHERE name like '%max server memory%') AS 'Max_SQL_Server_Memory_MB',
+   (SELECT physical_memory_in_use_kb/1024 FROM sys.dm_os_process_memory) AS 'SQL_Server_Memory_Usage_MB',
+   (SELECT total_physical_memory_kb/1024 FROM sys.dm_os_sys_memory) AS 'Physical_Memory_MB',
+   (SELECT available_physical_memory_kb/1024 FROM sys.dm_os_sys_memory) AS 'Available_Memory_MB',
+   (SELECT cntr_value FROM sys.dm_os_performance_counters WHERE object_name LIKE '%Manager%' AND counter_name = 'Page life expectancy') AS 'Page_Life_Expectancy',
+   (SELECT cntr_value FROM SYS.dm_os_performance_counters WHERE counter_name = 'Free list stalls/sec') as 'Free_list_stalls_sec', -- Number of requests per second that had to wait for a free page
+   (SELECT cntr_value FROM SYS.dm_os_performance_counters WHERE counter_name = 'Lazy writes/sec') as 'Lazy_writes_sec', --Flushes of dirty pages before a checkpoint runs. 
+   (SELECT cntr_value FROM SYS.dm_os_performance_counters WHERE counter_name = 'Buffer cache hit ratio') as 'Buffer_cache_hit_ratio_Value', --percentage of pages found in the buffer cache without having to read from disk you want this ratio to be high
+   (SELECT (a.cntr_value * 1.0 / b.cntr_value) * 100.0 as BufferCacheHitRatio FROM sys.dm_os_performance_counters  a
+JOIN  (SELECT cntr_value,OBJECT_NAME FROM sys.dm_os_performance_counters WHERE counter_name = 'Buffer cache hit ratio base'        AND 
+OBJECT_NAME = 'SQLServer:Buffer Manager') b ON  a.OBJECT_NAME = b.OBJECT_NAME WHERE a.counter_name = 'Buffer cache hit ratio'AND a.OBJECT_NAME = 'SQLServer:Buffer Manager') as 'BufferCacheHitRatio',
+   (SELECT system_memory_state_desc FROM sys.dm_os_sys_memory) AS 'System_Memory_State',
+   GETDATE() AS 'Record_Timestamp'
+   
+ ----Memory_consumtion_queries
+ SELECT TOP 100
+	CAST((qs.total_worker_time) / 1000000.0 AS DECIMAL(28,2)) AS [Total CPU time (s)],
+	CAST(qs.total_worker_time * 100.0 / qs.total_elapsed_time AS DECIMAL(28,2)) AS [% CPU],
+	qs.execution_count,
+	SUBSTRING (qt.text,(qs.statement_start_offset/2) + 1,
+				((CASE WHEN qs.statement_end_offset = -1
+					THEN LEN(CONVERT(NVARCHAR(MAX), qt.text)) * 2
+					ELSE qs.statement_end_offset 
+					END
+	- qs.statement_start_offset)/2) + 1) AS [Individual Query],
+	qt.text AS [Parent Query],
+	DB_NAME(qt.dbid) AS DatabaseName,
+	qp.query_plan
+FROM sys.dm_exec_query_stats qs
+CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) as qt
+CROSS APPLY sys.dm_exec_query_plan(qs.plan_handle) qp
+WHERE qs.total_elapsed_time > 0
+ORDER BY [Total CPU time (s)] DESC
+
